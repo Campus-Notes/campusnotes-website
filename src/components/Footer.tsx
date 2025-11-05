@@ -49,8 +49,8 @@ export function Footer() {
                 </Link>
               </li>
               <li>
-                <Link href="#contact" className="text-muted-foreground hover:text-foreground transition-colors">
-                  Contact
+                <Link href="/contact-us" className="text-muted-foreground hover:text-foreground transition-colors">
+                  Contact Us
                 </Link>
               </li>
             </ul>
@@ -72,6 +72,11 @@ export function Footer() {
               <li>
                 <Link href="/refund-policy" className="text-muted-foreground hover:text-foreground transition-colors">
                   Refund & Cancellation
+                </Link>
+              </li>
+              <li>
+                <Link href="/shipping-policy" className="text-muted-foreground hover:text-foreground transition-colors">
+                  Shipping Policy
                 </Link>
               </li>
             </ul>

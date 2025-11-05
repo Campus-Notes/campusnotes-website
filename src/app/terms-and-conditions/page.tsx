@@ -96,8 +96,8 @@ export default function TermsAndConditions() {
               <h2 className="text-2xl font-semibold mb-4">Contact Information</h2>
               <p>
                 For questions about these Terms & Conditions, please contact us at:{' '}
-                <a href="mailto:team@campusnotesplus.com" className="text-[#0057FF] hover:underline">
-                  team@campusnotesplus.com
+                <a href="mailto:teamcampusnotes@gmail.com" className="text-[#0057FF] hover:underline">
+                  teamcampusnotes@gmail.com
                 </a>
               </p>
             </section>
