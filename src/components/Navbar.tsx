@@ -1,5 +1,6 @@
 import Link from 'next/link';
 import { ThemeToggle } from './ThemeToggle';
+import { Button } from './ui/button';
 
 export function Navbar() {
   return (
@@ -26,10 +27,18 @@ export function Navbar() {
               Contact
             </Link>
             <ThemeToggle />
+            <Button variant="outline" size="sm" asChild>
+              <Link href="/auth">Login</Link>
+            </Button>
           </div>
 
           <div className="md:hidden">
-            <ThemeToggle />
+            <div className="flex items-center space-x-2">
+              <ThemeToggle />
+              <Link href="/auth" className="text-sm font-medium hover:text-primary transition-colors">
+                Login
+              </Link>
+            </div>
           </div>
         </div>
       </div>
