@@ -6,6 +6,8 @@ import { onAuthStateChanged, signOut, User } from 'firebase/auth';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import Image from 'next/image';
+
 
 export default function SignInScreen() {
   const [user, setUser] = useState<User | null>(null);
@@ -110,10 +112,18 @@ export default function SignInScreen() {
   return (
     <div className="flex justify-center items-center min-h-screen bg-background px-4 pt-16">
       <Card className="w-full max-w-md">
-        <CardHeader>
+        <CardHeader className="flex flex-col items-center gap-3">
+          <Image
+            src="/light_logo.png"
+            alt="CampusNotes+ Logo"
+            width={200}
+            height={100}
+            className="rounded-full object-cover"
+          />
           <CardTitle className="text-2xl">CampusNotes+ Admin Login</CardTitle>
           <CardDescription>Please sign in with your email</CardDescription>
         </CardHeader>
+
         <CardContent>
           <form onSubmit={handleEmailPasswordLogin} className="space-y-4">
             {error && (
