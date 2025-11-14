@@ -3,11 +3,16 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { auth, firestore } from '../../../firebase/clientApp';
 import { onAuthStateChanged, signOut, User } from 'firebase/auth';
-import { collection, getDocs, updateDoc, doc, DocumentData } from 'firebase/firestore';
+import { collection, getDocs, updateDoc, doc, DocumentData, deleteDoc } from 'firebase/firestore';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import Link from 'next/link';
+import Header from './components/Header';
+import BookGrid from './components/BookGrid';
+import BookDetailModal from './components/BookDetailModal';
+import PdfViewerModal from './components/PdfViewerModal';
+import { sanitizeBase64, base64ToBlob, decodeBase64, isBase64, generateHash, getDecodedContent } from './utils';
 
 // Define proper Note interface
 interface Note {
@@ -16,7 +21,8 @@ interface Note {
   fileName?: string;
   fileContent?: string;
   fileEncodedData?: string;
-  author?: string; // will store resolved owner firstname when available
+  author?: string;
+  ownerUid?: string;
   subject?: string;
   description?: string;
   category?: string;
@@ -24,6 +30,16 @@ interface Note {
   verified?: boolean;
   verifiedAt?: string;
   verifiedBy?: string;
+  fileHash?: string;
+  isCopyrighted?: boolean;
+  copyrightReason?: string;
+  createdAt?: string | Date;
+}
+
+interface DuplicateInfo {
+  originalNoteId: string;
+  originalOwnerUid: string;
+  duplicateNoteIds: string[];
 }
 
 export default function BookListPage() {
@@ -32,30 +48,58 @@ export default function BookListPage() {
   const [loading, setLoading] = useState<boolean>(true);
   const [selectedNote, setSelectedNote] = useState<Note | null>(null);
   const [verifying, setVerifying] = useState<boolean>(false);
+  const [deleting, setDeleting] = useState<boolean>(false);
   const [pdfUrl, setPdfUrl] = useState<string | null>(null);
   const [viewingPdf, setViewingPdf] = useState<boolean>(false);
   const [currentPdfNote, setCurrentPdfNote] = useState<Note | null>(null);
+  const [duplicates, setDuplicates] = useState<Record<string, DuplicateInfo>>({});
+  const [showCopyrightsOnly, setShowCopyrightsOnly] = useState<boolean>(false);
   const activeObjectUrl = useRef<string | null>(null);
-
-  // map of uid -> firstname
   const [usersMap, setUsersMap] = useState<Record<string, string>>({});
 
-  // Utility: sanitize base64 string (remove whitespace/newlines)
-  const sanitizeBase64 = (s: string): string => (typeof s === 'string' ? s.replace(/\s+/g, '') : s);
+  // helper functions moved to ./utils
 
-  // convert base64 string -> Blob
-  const base64ToBlob = (base64: string, mime = 'application/pdf'): Blob => {
-    const cleaned = sanitizeBase64(base64);
-    const byteChars = atob(cleaned);
-    const byteNumbers = new Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) {
-      byteNumbers[i] = byteChars.charCodeAt(i);
-    }
-    const byteArray = new Uint8Array(byteNumbers);
-    return new Blob([byteArray], { type: mime });
+  // Detect duplicates and copyright violations by comparing file hashes and owners
+  const detectDuplicatesAndCopyright = (notesList: Note[]): Record<string, DuplicateInfo> => {
+    const hashMap: Record<string, Note[]> = {};
+    const duplicateGroups: Record<string, DuplicateInfo> = {};
+
+    // Group notes by hash
+    notesList.forEach(note => {
+      if (note.fileHash) {
+        if (!hashMap[note.fileHash]) {
+          hashMap[note.fileHash] = [];
+        }
+        hashMap[note.fileHash].push(note);
+      }
+    });
+
+    // Analyze each group
+    Object.entries(hashMap).forEach(([hash, notesWithSameHash]) => {
+      if (notesWithSameHash.length > 1) {
+        // Sort by creation time to find the original
+        const sortedNotes = [...notesWithSameHash].sort((a, b) => {
+          const dateA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const dateB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          return dateA - dateB;
+        });
+
+        const original = sortedNotes[0];
+        const duplicatesOfOriginal = sortedNotes.slice(1);
+
+        duplicateGroups[hash] = {
+          originalNoteId: original.id,
+          originalOwnerUid: original.ownerUid || '',
+          duplicateNoteIds: duplicatesOfOriginal.map(n => n.id)
+        };
+      }
+    });
+
+    return duplicateGroups;
   };
 
-  // create an object URL for the PDF (and revoke previous if exists)
+  // base64ToBlob is in ./utils
+
   const createPdfUrl = (base64: string): string | null => {
     try {
       if (!base64) return null;
@@ -73,7 +117,6 @@ export default function BookListPage() {
     }
   };
 
-  // handle viewing pdf
   const handleViewPdf = (note: Note): void => {
     const base64 = note.fileContent || note.fileEncodedData;
     if (base64) {
@@ -90,7 +133,6 @@ export default function BookListPage() {
     }
   };
 
-  // handle download (use Blob + object URL for reliable download)
   const handleDownloadPdf = (note: Note): void => {
     const base64 = note.fileContent || note.fileEncodedData;
     if (!base64) {
@@ -102,7 +144,6 @@ export default function BookListPage() {
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      // prefer note.fileName, fallback to title or 'note.pdf'
       const filename = note.fileName || note.title || 'note';
       link.download = filename.endsWith('.pdf') ? filename : `${filename}.pdf`;
       document.body.appendChild(link);
@@ -115,64 +156,34 @@ export default function BookListPage() {
     }
   };
 
-  // decode text-like base64 fields (title/description etc.)
-  const decodeBase64 = (str: string): string => {
+  const handleDeleteNote = async (noteId: string): Promise<void> => {
+    if (!confirm('Are you sure you want to delete this duplicate note? This action cannot be undone.')) {
+      return;
+    }
+
+    setDeleting(true);
     try {
-      // some text fields might be base64 encoded; attempt a decode, else return original
-      const cleaned = sanitizeBase64(str);
-      return decodeURIComponent(atob(cleaned).split('').map((c) => {
-        return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
-      }).join(''));
+      const noteRef = doc(firestore, 'notes', noteId);
+      await deleteDoc(noteRef);
+
+      setNotes(notes.filter(note => note.id !== noteId));
+      setSelectedNote(null);
+      
+      // Recalculate duplicates after deletion
+      const updatedNotes = notes.filter(note => note.id !== noteId);
+      const newDuplicates = detectDuplicatesAndCopyright(updatedNotes);
+      setDuplicates(newDuplicates);
+
+      alert('Note deleted successfully.');
     } catch (error) {
-      return str;
+      console.error('Error deleting note:', error);
+      alert('Failed to delete note. Please try again.');
+    } finally {
+      setDeleting(false);
     }
   };
 
-  // check if a string looks like base64 (simple heuristic)
-  const isBase64 = (str: string): boolean => {
-    if (typeof str !== 'string') return false;
-    // basic regex check (allows padding), avoid throwing on invalid input
-    return /^[A-Za-z0-9+/=\s]+$/.test(str) && str.length % 4 === 0;
-  };
-
-  // Normalize the raw note: map backend names to what the UI expects, decode text fields if base64
-  const getDecodedContent = (note: DocumentData & { id: string }): Note => {
-    const decodedNote: Note = { ...note, id: note.id };
-
-    // map backend binary/text fields to UI-friendly keys
-    if (!decodedNote.fileContent && decodedNote.fileEncodedData) {
-      decodedNote.fileContent = sanitizeBase64(decodedNote.fileEncodedData);
-    }
-
-    // Map ownerUid to author for display (note: lowercase 'd')
-    if (!decodedNote.author && (decodedNote.ownerUid || (note as any).ownerUId)) {
-      decodedNote.author = (note as any).ownerUid || (note as any).ownerUId;
-    }
-
-    if (!decodedNote.fileName && decodedNote.fileName === undefined && decodedNote.fileName !== null) {
-      // no-op but keeps parity
-    }
-
-    if ((!decodedNote.title || decodedNote.title === '') && decodedNote.fileName) {
-      decodedNote.title = decodedNote.fileName;
-    }
-
-    // decode textual fields if they appear to be base64
-    (['title', 'author', 'subject', 'description', 'category'] as const).forEach((k) => {
-      const value = decodedNote[k];
-      if (value && typeof value === 'string' && isBase64(value)) {
-        decodedNote[k] = decodeBase64(value);
-      }
-    });
-
-    if (decodedNote.tags && Array.isArray(decodedNote.tags)) {
-      decodedNote.tags = decodedNote.tags.map(tag => 
-        (typeof tag === 'string' && isBase64(tag) ? decodeBase64(tag) : tag)
-      );
-    }
-
-    return decodedNote;
-  };
+  // decoding helpers moved to ./utils
 
   useEffect(() => {
     if (!auth) {
@@ -190,14 +201,12 @@ export default function BookListPage() {
     });
 
     return () => {
-      // revoke any object URL when leaving page
       if (activeObjectUrl.current) {
         URL.revokeObjectURL(activeObjectUrl.current);
         activeObjectUrl.current = null;
       }
       unsubscribe();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const fetchNotes = async (): Promise<void> => {
@@ -208,26 +217,21 @@ export default function BookListPage() {
         return;
       }
 
-      // Fetch notes
-      const notesCollection = collection(firestore, 'notes');
-      const notesSnapshot = await getDocs(notesCollection);
-      const rawNotes = notesSnapshot.docs.map(docSnap => ({ id: docSnap.id, ...docSnap.data() }));
+  const notesCollection = collection(firestore, 'notes');
+  const notesSnapshot = await getDocs(notesCollection);
+  const rawNotes = notesSnapshot.docs.map(docSnap => ({ id: docSnap.id, ...(docSnap.data() as any) })) as any[];
 
-      // Fetch users collection (to resolve ownerUid -> firstname)
       const usersCollection = collection(firestore, 'users');
       const usersSnapshot = await getDocs(usersCollection);
       const usersMapTemp: Record<string, string> = {};
       usersSnapshot.docs.forEach(u => {
         const data = u.data() as DocumentData;
-        // field name might be 'firstname' (per your note). try multiple fallbacks
         const name = data.firstname || data.firstName || data.first_name || data.name || 'Unknown';
         usersMapTemp[u.id] = name;
       });
       setUsersMap(usersMapTemp);
 
-      // Process and decode notes
-      const notesList: Note[] = rawNotes.map((rawNote) => {
-        // Map backend keys to front-end friendly ones before decoding:
+      const notesList: Note[] = await Promise.all(rawNotes.map(async (rawNote) => {
         if ((rawNote as any).fileEncodedData && !rawNote.fileContent) {
           rawNote.fileContent = sanitizeBase64((rawNote as any).fileEncodedData);
         }
@@ -235,21 +239,64 @@ export default function BookListPage() {
           rawNote.title = rawNote.fileName;
         }
 
-        // keep previous ownerUid -> author mapping
-        if (!rawNote.author && (rawNote as any).ownerUId) {
-          rawNote.author = (rawNote as any).ownerUId;
-        }
-
         const decoded = getDecodedContent(rawNote as DocumentData & { id: string });
 
-        // Resolve owner UID to firstname from usersMapTemp
+        // Extract ownerUid
         const ownerUid = (rawNote as any).ownerUid || (rawNote as any).ownerUId;
+        decoded.ownerUid = ownerUid;
+
+        // Resolve owner UID to firstname
         if (ownerUid && usersMapTemp[ownerUid]) {
           decoded.author = usersMapTemp[ownerUid];
         }
 
+        // Generate hash if not exists
+        if (!decoded.fileHash && decoded.fileContent) {
+          decoded.fileHash = await generateHash(decoded.fileContent);
+          
+          try {
+            const noteRef = doc(firestore, 'notes', decoded.id);
+            await updateDoc(noteRef, { fileHash: decoded.fileHash });
+          } catch (error) {
+            console.error('Error updating hash:', error);
+          }
+        }
+
         return decoded;
-      });
+      }));
+
+      // Detect duplicates and copyright violations
+      const duplicateGroups = detectDuplicatesAndCopyright(notesList);
+      setDuplicates(duplicateGroups);
+
+      // Mark copyright violations and update Firestore
+      for (const [hash, dupInfo] of Object.entries(duplicateGroups)) {
+        const originalNote = notesList.find(n => n.id === dupInfo.originalNoteId);
+        const originalOwnerName = originalNote?.author || 'Unknown';
+
+        for (const duplicateId of dupInfo.duplicateNoteIds) {
+          const duplicateNote = notesList.find(n => n.id === duplicateId);
+          
+          if (duplicateNote && duplicateNote.ownerUid !== dupInfo.originalOwnerUid) {
+            // This is a copyright violation (different owner)
+            duplicateNote.isCopyrighted = true;
+            duplicateNote.copyrightReason = `Detected copyright issue – this file already exists and was originally uploaded by ${originalOwnerName}.`;
+
+            // Update Firestore
+            try {
+              const noteRef = doc(firestore, 'notes', duplicateId);
+              await updateDoc(noteRef, {
+                isCopyrighted: true,
+                copyrightReason: duplicateNote.copyrightReason,
+                verified: false,
+                isVerified: false
+              });
+            } catch (error) {
+              console.error('Error marking copyright:', error);
+            }
+          }
+        }
+      }
 
       setNotes(notesList);
       setLoading(false);
@@ -262,35 +309,31 @@ export default function BookListPage() {
   const handleVerifyNote = async (noteId: string): Promise<void> => {
     if (!user) return;
 
+    const note = notes.find(n => n.id === noteId);
+    if (note?.isCopyrighted) {
+      alert('Cannot verify copyrighted content. This file was uploaded by another user first.');
+      return;
+    }
+
     setVerifying(true);
     try {
       const noteRef = doc(firestore, 'notes', noteId);
-
       const verifiedAt = new Date().toISOString();
       const verifiedBy = user.email || user.uid || 'admin';
 
-      // Update both field names in Firestore to be safe
       await updateDoc(noteRef, {
         isVerified: true,
-        verified: true,            // keep legacy field in sync
+        verified: true,
         verifiedAt,
         verifiedBy,
       });
 
-      // Update local state: set both flags so UI and details modal reflect change immediately
       setNotes(notes.map((note) =>
         note.id === noteId
-          ? {
-              ...note,
-              isVerified: true,
-              verified: true,
-              verifiedAt,
-              verifiedBy,
-            }
+          ? { ...note, isVerified: true, verified: true, verifiedAt, verifiedBy }
           : note
       ));
 
-      // if a note is open in detail modal, close it (your existing behavior)
       setSelectedNote(null);
     } catch (error) {
       console.error('Error verifying note:', error);
@@ -299,7 +342,6 @@ export default function BookListPage() {
       setVerifying(false);
     }
   };
-
 
   const handleSignOut = async (): Promise<void> => {
     try {
@@ -310,10 +352,38 @@ export default function BookListPage() {
     }
   };
 
+  const getOriginalNote = (noteId: string): Note | undefined => {
+    for (const dupInfo of Object.values(duplicates)) {
+      if (dupInfo.duplicateNoteIds.includes(noteId)) {
+        return notes.find(n => n.id === dupInfo.originalNoteId);
+      }
+    }
+    return undefined;
+  };
+
+  const isDuplicateNote = (noteId: string): boolean => {
+    return Object.values(duplicates).some(dupInfo => dupInfo.duplicateNoteIds.includes(noteId));
+  };
+
+  const isSameOwnerDuplicate = (note: Note): boolean => {
+    if (!isDuplicateNote(note.id)) return false;
+    
+    for (const dupInfo of Object.values(duplicates)) {
+      if (dupInfo.duplicateNoteIds.includes(note.id)) {
+        return note.ownerUid === dupInfo.originalOwnerUid;
+      }
+    }
+    return false;
+  };
+
+  const filteredNotes = showCopyrightsOnly
+    ? notes.filter(note => note.isCopyrighted)
+    : notes;
+
   if (loading) {
     return (
       <div className="flex justify-center items-center min-h-screen">
-        <p className="text-lg">Loading notes...</p>
+        <p className="text-lg">Loading notes and checking for copyright violations...</p>
       </div>
     );
   }
@@ -326,280 +396,73 @@ export default function BookListPage() {
     );
   }
 
+  const copyrightCount = notes.filter(n => n.isCopyrighted).length;
+
   return (
     <div className="min-h-screen bg-background">
-      {/* Header */}
-      <div className="border-b border-border bg-background/80 backdrop-blur-md sticky top-0 z-40">
-        <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-4">
-          <div className="flex justify-between items-center">
-            <div>
-              <h1 className="text-2xl font-bold">CampusNotes+ Admin Dashboard</h1>
-              <p className="text-sm text-muted-foreground">Logged in as: {user.email}</p>
-            </div>
-            <Button variant="outline" onClick={handleSignOut}>
-              Sign Out
-            </Button>
-          </div>
-        </div>
-      </div>
+      <Header userEmail={user.email} onSignOut={handleSignOut} />
 
       {/* Main Content */}
       <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* Copyright Detection Alert */}
+        {copyrightCount > 0 && (
+          <Alert className="mb-6 border-red-500/50 bg-red-500/10">
+            <AlertDescription className="flex items-center justify-between">
+              <span className="text-red-700 dark:text-red-400">
+                ⚠️ {copyrightCount} copyright violation{copyrightCount > 1 ? 's' : ''} detected
+              </span>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setShowCopyrightsOnly(!showCopyrightsOnly)}
+              >
+                {showCopyrightsOnly ? 'Show All' : 'Show Copyrights Only'}
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+
         {/* Notes Grid */}
-        {notes.length === 0 ? (
+        {filteredNotes.length === 0 ? (
           <Card className="text-center">
             <CardHeader>
-              <CardTitle>No Notes Yet</CardTitle>
+              <CardTitle>No Notes {showCopyrightsOnly ? 'Match Filter' : 'Yet'}</CardTitle>
               <CardDescription>
-                No notes have been submitted for verification yet.
+                {showCopyrightsOnly 
+                  ? 'No copyright violations found.'
+                  : 'No notes have been submitted for verification yet.'}
               </CardDescription>
             </CardHeader>
           </Card>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-            {notes.map((note) => (
-              <Card
-                key={note.id}
-                className={`cursor-pointer transition-all hover:shadow-lg ${
-                  note.verified ? 'border-blue-500/50' : 'border-yellow-500/50'
-                }`}
-              >
-                <CardHeader>
-                  <div className="flex justify-between items-start">
-                    <div className="flex-1">
-                      <CardTitle className="text-lg">{note.title || 'Untitled'}</CardTitle>
-                      <CardDescription>
-                        {note.author || 'Unknown Author'}
-                      </CardDescription>
-                    </div>
-                    <div className="text-xs font-semibold px-2 py-1 rounded">
-                      {note.verified ? (
-                        <span className=" text-green-700 dark:text-green-400">
-                          ✓ Verified
-                        </span>
-                      ) : (
-                        <span className=" text-red-500 dark:text-yellow-400">
-                          Pending
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div>
-                    <p className="text-sm text-muted-foreground mb-2">Subject:</p>
-                    <p className="text-sm font-medium">{note.subject || 'N/A'}</p>
-                  </div>
-                  {note.description && (
-                    <div>
-                      <p className="text-sm text-muted-foreground mb-2">Description:</p>
-                      <p className="text-sm line-clamp-3">{note.description}</p>
-                    </div>
-                  )}
-                  <div className="flex gap-2 pt-4">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => setSelectedNote(note)}
-                      className="flex-1"
-                    >
-                      View Details
-                    </Button>
-                    {note.fileContent && (
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => handleViewPdf(note)}
-                        className="flex-1"
-                      >
-                        View PDF
-                      </Button>
-                    )}
-                    {!note.verified && (
-                      <Button
-                        size="sm"
-                        className="flex-1 bg-blue-600 hover:bg-blue-700"
-                        onClick={() => handleVerifyNote(note.id)}
-                        disabled={verifying}
-                      >
-                        {verifying ? 'Verifying...' : 'Verify'}
-                      </Button>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
+          <BookGrid
+            notes={notes}
+            filteredNotes={filteredNotes}
+            isDuplicateNote={isDuplicateNote}
+            isSameOwnerDuplicate={isSameOwnerDuplicate}
+            getOriginalNote={getOriginalNote}
+            verifying={verifying}
+            onSelect={(note) => setSelectedNote(note)}
+            onViewPdf={handleViewPdf}
+            onVerify={handleVerifyNote}
+          />
         )}
       </div>
 
       {/* Detail Modal */}
-      {selectedNote && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
-          <Card className="w-full max-w-2xl max-h-[90vh] overflow-y-auto">
-            <CardHeader className="flex justify-between items-start">
-              <div>
-                <CardTitle>{selectedNote.title || 'Untitled'}</CardTitle>
-                <CardDescription>{selectedNote.author || 'Unknown Author'}</CardDescription>
-              </div>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => setSelectedNote(null)}
-              >
-                ✕
-              </Button>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div>
-                <p className="font-semibold text-sm mb-1">Subject:</p>
-                <p className="text-sm">{selectedNote.subject || 'N/A'}</p>
-              </div>
-              <div>
-                <p className="font-semibold text-sm mb-1">Description:</p>
-                <p className="text-sm whitespace-pre-wrap">
-                  {selectedNote.description || 'No description'}
-                </p>
-              </div>
-              {selectedNote.category && (
-                <div>
-                  <p className="font-semibold text-sm mb-1">Category:</p>
-                  <p className="text-sm">{selectedNote.category}</p>
-                </div>
-              )}
-              {selectedNote.tags && (
-                <div>
-                  <p className="font-semibold text-sm mb-2">Tags:</p>
-                  <div className="flex gap-2 flex-wrap">
-                    {selectedNote.tags.map((tag, idx) => (
-                      <span
-                        key={idx}
-                        className="px-2 py-1 bg-primary/10 text-primary rounded text-xs"
-                      >
-                        {tag}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {selectedNote.verified && selectedNote.verifiedAt && selectedNote.verifiedBy && (
-                <div className="bg-green-500/10 border border-green-500/30 rounded p-3">
-                  <p className="text-xs text-green-700 dark:text-green-400">
-                    ✓ Verified by {selectedNote.verifiedBy} on{' '}
-                    {new Date(selectedNote.verifiedAt).toLocaleDateString()}
-                  </p>
-                </div>
-              )}
-              {selectedNote.fileContent && (
-                <div className="bg-blue-500/10 border border-blue-500/30 rounded p-3">
-                  <p className="text-xs text-blue-700 dark:text-blue-400 mb-3">
-                    📄 PDF file attached
-                  </p>
-                  <div className="flex gap-2">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleViewPdf(selectedNote)}
-                      className="flex-1"
-                    >
-                      View PDF
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleDownloadPdf(selectedNote)}
-                      className="flex-1"
-                    >
-                      Download PDF
-                    </Button>
-                  </div>
-                </div>
-              )}
-              {!selectedNote.fileContent && (
-                <div className="bg-yellow-500/10 border border-yellow-500/30 rounded p-3">
-                  <p className="text-xs text-yellow-700 dark:text-yellow-400">
-                    ⚠️ No PDF file attached
-                  </p>
-                </div>
-              )}
-              <div className="flex gap-2 pt-4">
-                <Button
-                  variant="outline"
-                  className="flex-1"
-                  onClick={() => setSelectedNote(null)}
-                >
-                  Close
-                </Button>
-                {!selectedNote.verified && (
-                  <Button
-                    className="flex-1 bg-blue-600 hover:bg-blue-700"
-                    onClick={() => handleVerifyNote(selectedNote.id)}
-                    disabled={verifying}
-                  >
-                    {verifying ? 'Verifying...' : 'Verify This Note'}
-                  </Button>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      )}
+      <BookDetailModal
+        selectedNote={selectedNote}
+        onClose={() => setSelectedNote(null)}
+        onDelete={handleDeleteNote}
+        onVerify={handleVerifyNote}
+        verifying={verifying}
+        deleting={deleting}
+        isSameOwnerDuplicate={isSameOwnerDuplicate}
+        onViewPdf={handleViewPdf}
+        onDownloadPdf={handleDownloadPdf}
+      />
 
-      {/* PDF Viewer Modal */}
-      {viewingPdf && pdfUrl && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
-          <Card className="w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
-            <CardHeader className="flex justify-between items-center border-b">
-              <CardTitle>PDF Viewer</CardTitle>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => {
-                  setViewingPdf(false);
-                  setPdfUrl(null);
-                  setCurrentPdfNote(null);
-                  if (activeObjectUrl.current) {
-                    URL.revokeObjectURL(activeObjectUrl.current);
-                    activeObjectUrl.current = null;
-                  }
-                }}
-              >
-                ✕
-              </Button>
-            </CardHeader>
-            <div className="flex-1 overflow-hidden bg-gray-100 dark:bg-gray-900">
-              <iframe
-                src={pdfUrl}
-                className="w-full h-full border-none"
-                title="PDF Viewer"
-              />
-            </div>
-            <div className="border-t p-4 flex gap-2 justify-end">
-              <Button
-                variant="outline"
-                className='bg-blue-600 text-white'
-                onClick={() => currentPdfNote && handleDownloadPdf(currentPdfNote)}
-              >
-                Download PDF
-              </Button>
-              <Button
-                variant="outline"
-                onClick={() => {
-                  setViewingPdf(false);
-                  setPdfUrl(null);
-                  setCurrentPdfNote(null);
-                  if (activeObjectUrl.current) {
-                    URL.revokeObjectURL(activeObjectUrl.current);
-                    activeObjectUrl.current = null;
-                  }
-                }}
-              >
-                Close
-              </Button>
-            </div>
-          </Card>
-        </div>
-      )}
+      <PdfViewerModal viewing={viewingPdf} pdfUrl={pdfUrl} onClose={() => { setViewingPdf(false); setPdfUrl(null); setCurrentPdfNote(null); if (activeObjectUrl.current) { URL.revokeObjectURL(activeObjectUrl.current); activeObjectUrl.current = null; } }} onDownload={() => currentPdfNote && handleDownloadPdf(currentPdfNote)} />
     </div>
   );
 }
