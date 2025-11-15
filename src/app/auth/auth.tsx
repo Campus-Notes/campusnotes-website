@@ -1,48 +1,95 @@
 'use client';
 
 import React, { useEffect, useState } from 'react';
-import { auth } from '../../../firebase/clientApp';
+import { auth } from '../../../firebase/clientApp'; // keep this if your clientApp exports auth
 import { onAuthStateChanged, signOut, User } from 'firebase/auth';
+import { getDoc, doc } from 'firebase/firestore';
+import { firestore } from '../../../firebase/clientApp'; // ensure clientApp exports firestore (or rename to db)
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import Image from 'next/image';
 
-
 export default function SignInScreen() {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
-  const [firebaseConfigured, setFirebaseConfigured] = useState(!!auth);
+  const [firebaseConfigured, setFirebaseConfigured] = useState(!!auth && !!firestore);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const [adminVerified, setAdminVerified] = useState(false); // only redirect when true
 
+  // On mount: listen for auth state changes and verify admin if a user is present
   useEffect(() => {
-    if (!auth) {
-      setLoading(false);
+    if (!auth || !firestore) {
       setFirebaseConfigured(false);
+      setLoading(false);
       return;
     }
 
-    try {
-      const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-        setUser(currentUser);
-        setLoading(false);
-      });
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      setError('');
+      setAdminVerified(false);
 
-      return () => unsubscribe();
-    } catch (error) {
-      console.error('Auth error:', error);
-      setLoading(false);
-    }
+      if (!currentUser) {
+        // no user signed in
+        setLoading(false);
+        return;
+      }
+
+      // user signed in — verify admin in Firestore
+      try {
+        const userRef = doc(firestore, 'users', currentUser.uid);
+        const snap = await getDoc(userRef);
+
+        if (!snap.exists()) {
+          // no document -> not admin
+          await signOut(auth);
+          setUser(null);
+          setError('Invalid Credentials — Not admin');
+          setLoading(false);
+          return;
+        }
+
+        const data = snap.data();
+        if (data?.isAdmin !== true) {
+          await signOut(auth);
+          setUser(null);
+          setError('Invalid Credentials — Not admin');
+          setLoading(false);
+          return;
+        }
+
+        // admin confirmed
+        setAdminVerified(true);
+        setLoading(false);
+      } catch (err) {
+        console.error('Error checking admin status:', err);
+        await signOut(auth).catch(() => {});
+        setUser(null);
+        setError('Login failed. Try again.');
+        setLoading(false);
+      }
+    });
+
+    return () => unsubscribe();
   }, []);
+
+  // When adminVerified becomes true, redirect
+  useEffect(() => {
+    if (adminVerified && typeof window !== 'undefined') {
+      window.location.href = '/BookList';
+    }
+  }, [adminVerified]);
 
   const handleSignOut = async () => {
     if (!auth) return;
     try {
       await signOut(auth);
       setUser(null);
+      setAdminVerified(false);
     } catch (error) {
       console.error('Error signing out:', error);
     }
@@ -83,28 +130,26 @@ export default function SignInScreen() {
     );
   }
 
-  if (user) {
-    // Redirect to BookList dashboard after successful login
-    if (typeof window !== 'undefined') {
-      window.location.href = '/BookList';
-    }
-    return (
-      <div className="flex justify-center items-center min-h-screen">
-        <p className="text-lg">Redirecting to dashboard...</p>
-      </div>
-    );
-  }
-
   const handleEmailPasswordLogin = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError('');
     setIsLoggingIn(true);
 
     try {
+      // dynamic import to keep bundle small (optional)
       const { signInWithEmailAndPassword } = await import('firebase/auth');
-      await signInWithEmailAndPassword(auth, email, password);
-    } catch (err) {
-      setError(err.message || 'Login failed. Please try again.');
+      const cred = await signInWithEmailAndPassword(auth, email, password);
+
+      // After sign-in, onAuthStateChanged listener will run and perform the admin check.
+      // We just wait a short while for it to complete. If you want synchronous check here,
+      // you can fetch Firestore right away (shown below), but using the listener keeps logic centralized.
+      // Optionally add a fallback timeout:
+      setTimeout(() => {
+        setIsLoggingIn(false);
+      }, 1500);
+    } catch (err: any) {
+      console.error('Login error:', err);
+      setError(err?.message || 'Login failed. Please try again.');
       setIsLoggingIn(false);
     }
   };
@@ -164,6 +209,11 @@ export default function SignInScreen() {
             <Button type="submit" className="w-full" disabled={isLoggingIn}>
               {isLoggingIn ? 'Signing in...' : 'Sign In'}
             </Button>
+            {user && (
+              <div className="text-center text-sm mt-2">
+                <Button variant="ghost" onClick={handleSignOut}>Sign out</Button>
+              </div>
+            )}
           </form>
         </CardContent>
       </Card>
