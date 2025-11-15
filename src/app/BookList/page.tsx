@@ -217,9 +217,9 @@ export default function BookListPage() {
         return;
       }
 
-  const notesCollection = collection(firestore, 'notes');
-  const notesSnapshot = await getDocs(notesCollection);
-  const rawNotes = notesSnapshot.docs.map(docSnap => ({ id: docSnap.id, ...(docSnap.data() as any) })) as any[];
+      const notesCollection = collection(firestore, 'notes');
+      const notesSnapshot = await getDocs(notesCollection);
+      const rawNotes = notesSnapshot.docs.map(docSnap => ({ id: docSnap.id, ...(docSnap.data() as any) })) as any[];
 
       const usersCollection = collection(firestore, 'users');
       const usersSnapshot = await getDocs(usersCollection);
@@ -253,7 +253,7 @@ export default function BookListPage() {
         // Generate hash if not exists
         if (!decoded.fileHash && decoded.fileContent) {
           decoded.fileHash = await generateHash(decoded.fileContent);
-          
+
           try {
             const noteRef = doc(firestore, 'notes', decoded.id);
             await updateDoc(noteRef, { fileHash: decoded.fileHash });
@@ -262,6 +262,13 @@ export default function BookListPage() {
           }
         }
 
+        // Ensure default values exist to avoid undefined checks later
+        decoded.isCopyrighted = decoded.isCopyrighted ?? false;
+        decoded.verified = decoded.verified ?? false;
+        decoded.isVerified = decoded.isVerified ?? decoded.verified ?? false;
+        decoded.isDuplicate = decoded.isDuplicate ?? false;
+        decoded.duplicateReason = decoded.duplicateReason ?? '';
+
         return decoded;
       }));
 
@@ -269,20 +276,60 @@ export default function BookListPage() {
       const duplicateGroups = detectDuplicatesAndCopyright(notesList);
       setDuplicates(duplicateGroups);
 
-      // Mark copyright violations and update Firestore
+      // --- NEW: Mark duplicates in Firestore (and update local notesList) ---
       for (const [hash, dupInfo] of Object.entries(duplicateGroups)) {
         const originalNote = notesList.find(n => n.id === dupInfo.originalNoteId);
         const originalOwnerName = originalNote?.author || 'Unknown';
+        const originalOwnerUid = dupInfo.originalOwnerUid || originalNote?.ownerUid || '';
 
+        // For each duplicate note (not the original) set isDuplicate and duplicateReason
         for (const duplicateId of dupInfo.duplicateNoteIds) {
           const duplicateNote = notesList.find(n => n.id === duplicateId);
-          
-          if (duplicateNote && duplicateNote.ownerUid !== dupInfo.originalOwnerUid) {
-            // This is a copyright violation (different owner)
+          if (!duplicateNote) continue;
+
+          const reason = `Duplicate of note ${dupInfo.originalNoteId} (original uploader: ${originalOwnerName}).`;
+
+          // Update local object
+          duplicateNote.isDuplicate = true;
+          duplicateNote.duplicateReason = reason;
+
+          // Persist to Firestore
+          try {
+            const noteRef = doc(firestore, 'notes', duplicateId);
+            await updateDoc(noteRef, {
+              isDuplicate: true,
+              duplicateReason: reason
+            });
+          } catch (error) {
+            console.error(`Error updating duplicate flags for ${duplicateId}:`, error);
+          }
+        }
+
+        // Ensure the original note is marked as not duplicate (explicitly)
+        if (originalNote) {
+          originalNote.isDuplicate = false;
+          originalNote.duplicateReason = originalNote.duplicateReason ?? '';
+
+          try {
+            const originalRef = doc(firestore, 'notes', originalNote.id);
+            await updateDoc(originalRef, {
+              isDuplicate: false,
+              // do not override duplicateReason if it exists and is meaningful
+              duplicateReason: originalNote.duplicateReason || ''
+            });
+          } catch (error) {
+            console.error(`Error ensuring original note ${originalNote.id} is not flagged as duplicate:`, error);
+          }
+        }
+
+        // Additionally mark copyright violations for duplicates that belong to different owners
+        for (const duplicateId of dupInfo.duplicateNoteIds) {
+          const duplicateNote = notesList.find(n => n.id === duplicateId);
+          if (duplicateNote && duplicateNote.ownerUid !== originalOwnerUid) {
             duplicateNote.isCopyrighted = true;
             duplicateNote.copyrightReason = `Detected copyright issue – this file already exists and was originally uploaded by ${originalOwnerName}.`;
 
-            // Update Firestore
+            // Update Firestore (keep previous updates and add copyright fields)
             try {
               const noteRef = doc(firestore, 'notes', duplicateId);
               await updateDoc(noteRef, {
@@ -292,11 +339,21 @@ export default function BookListPage() {
                 isVerified: false
               });
             } catch (error) {
-              console.error('Error marking copyright:', error);
+              console.error(`Error marking copyright for ${duplicateId}:`, error);
             }
           }
         }
       }
+
+      // If there are notes that are not part of any duplicate group, ensure they have isDuplicate:false in local list
+      const duplicateIds = new Set<string>();
+      Object.values(duplicateGroups).forEach(g => g.duplicateNoteIds.forEach(id => duplicateIds.add(id)));
+      notesList.forEach(n => {
+        if (!duplicateIds.has(n.id)) {
+          n.isDuplicate = false;
+          // leave duplicateReason as-is (or clear if you prefer)
+        }
+      });
 
       setNotes(notesList);
       setLoading(false);
@@ -305,6 +362,7 @@ export default function BookListPage() {
       setLoading(false);
     }
   };
+
 
   const handleVerifyNote = async (noteId: string): Promise<void> => {
     if (!user) return;
